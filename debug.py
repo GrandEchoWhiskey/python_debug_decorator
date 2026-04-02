@@ -1,7 +1,8 @@
 from typing import Callable, Any
-from inspect import signature, Parameter
+import inspect
+import datetime
 
-def debug(*, output: Callable[[str], None] = print, catch_exceptions: bool = False):
+def debug(*, output: Callable[[str], Any] = print, catch_exceptions: bool = False) -> Callable[[Callable], Callable]:
     """
     A debugging decorator that logs function calls with detailed parameter information.
     This decorator traces function execution by capturing and displaying:
@@ -9,6 +10,7 @@ def debug(*, output: Callable[[str], None] = print, catch_exceptions: bool = Fal
     - Variable positional (*args) and keyword (**kwargs) parameters
     - Parameter types and values
     - Return values and exceptions
+    - Execution time for the function call
     Args:
         output: Callable to handle debug messages (default: print)
         catch_exceptions: If True, suppress exceptions and return None; if False, re-raise them
@@ -17,39 +19,73 @@ def debug(*, output: Callable[[str], None] = print, catch_exceptions: bool = Fal
     """
     def wrapper(func: Callable) -> Callable:
 
-        PARAMS = signature(func).parameters
-        POSITIONAL = {k: v for k, v in PARAMS.items() if v.kind == Parameter.POSITIONAL_ONLY}
-        POSITIONAL_OR_KEYWORD = {k: v for k, v in PARAMS.items() if v.kind == Parameter.POSITIONAL_OR_KEYWORD}
-        VAR_POSITIONAL = next((v for v in PARAMS.values() if v.kind == Parameter.VAR_POSITIONAL), None)
-        KEYWORD = {k: v for k, v in PARAMS.items() if v.kind == Parameter.KEYWORD_ONLY}
-        VAR_KEYWORD = next((v for v in PARAMS.values() if v.kind == Parameter.VAR_KEYWORD), None)
-
         def inner(*args, **kwargs):
 
-            pos_only: dict[str, Any] = dict(zip(POSITIONAL.keys(), args[:len(POSITIONAL)]))
-            pos_or_kw: dict[str, Any] = dict(zip(POSITIONAL_OR_KEYWORD.keys(), args[len(POSITIONAL):len(POSITIONAL) + len(POSITIONAL_OR_KEYWORD)]))
-            var_pos: dict[str, list[Any]] = {VAR_POSITIONAL.name: list(args[len(POSITIONAL) + len(POSITIONAL_OR_KEYWORD):])} if VAR_POSITIONAL else {}
-            kw_only: dict[str, Any] = {k: kwargs[k] for k in KEYWORD.keys() if k in kwargs}
-            var_kw: dict[str, dict[str, Any]] = {VAR_KEYWORD.name: {k: v for k, v in kwargs.items() if k not in POSITIONAL_OR_KEYWORD and k not in KEYWORD}} if VAR_KEYWORD else {}
+            fnc_sig = inspect.signature(func)
+            fnc_params = fnc_sig.parameters
 
-            list_of_pargs = [f"{k}: {PARAMS[k].annotation.__name__} = {type(v).__name__}[{v!r}]" for k, v in {**pos_only}.items()]
-            list_of_args = [f"{k}: {PARAMS[k].annotation.__name__} = {type(v).__name__}[{v!r}]" for k, v in {**pos_or_kw}.items()]
-            pos_var = f"*{VAR_POSITIONAL.name}: {VAR_POSITIONAL.annotation.__name__} = {type(var_pos[VAR_POSITIONAL.name]).__name__}[{', '.join(map(str, var_pos[VAR_POSITIONAL.name]))}]" if VAR_POSITIONAL else None
-            list_of_kw = [f"{k}: {PARAMS[k].annotation.__name__} = {type(v).__name__}[{v!r}]" for k, v in kw_only.items()]
-            kw_var = f"**{VAR_KEYWORD.name}: {VAR_KEYWORD.annotation.__name__} = {type(var_kw[VAR_KEYWORD.name]).__name__}[{', '.join(f'{k} = {type(v).__name__}[{v!r}]' for k, v in var_kw[VAR_KEYWORD.name].items())}]" if VAR_KEYWORD else None
+            def params(kind: Any) -> list[str]:
+                return [param.name for param in fnc_params.values() if param.kind == kind]
             
-            fn_args = ", ".join(filter(None, list_of_pargs + ['/',] + list_of_args + [pos_var] + list_of_kw + [kw_var]))
+            def var_params(kind: Any) -> str | None:
+                return next((param.name for param in fnc_params.values() if param.kind == kind), None)
 
-            output(f"Calling {type(func).__name__} {func.__name__}({fn_args})")
+            pos_only_params = params(inspect.Parameter.POSITIONAL_ONLY)
+            pos_or_kw_params = params(inspect.Parameter.POSITIONAL_OR_KEYWORD)
+            kw_only_params = params(inspect.Parameter.KEYWORD_ONLY)
+            pos_var_param = var_params(inspect.Parameter.VAR_POSITIONAL)
+            kw_var_param = var_params(inspect.Parameter.VAR_KEYWORD)
+
+            fnc_sig_args = fnc_sig.bind(*args, **kwargs)
+            fnc_sig_args.apply_defaults()
+            fnc_args = dict(fnc_sig_args.arguments)
+                
+            def view_param(name: str, var: bool = False) -> str:
+                param = fnc_params[name]
+                value = fnc_args[name]
+                match (var, param.annotation is inspect._empty):
+                    case (True, True): return f"{name} = {value!r}"
+                    case (True, False): return f"{name}: {param.annotation.__name__} = {value!r}"
+                    case (False, True): return f"{name} = {type(value).__name__}[{value!r}]"
+                    case (False, False): return f"{name}: {param.annotation.__name__} = {type(value).__name__}[{value!r}]"
+            
+            fn_args: list[str] = []
+            if pos_only_params:
+                fn_args.append(", ".join(view_param(name) for name in pos_only_params))
+                fn_args.append("/")
+            if pos_or_kw_params:
+                fn_args.append(", ".join(view_param(name) for name in pos_or_kw_params))
+            if kw_only_params:
+                fn_args.append(("*" + view_param(pos_var_param, var=True)) if pos_var_param else "*")
+                fn_args.append(", ".join(view_param(name) for name in kw_only_params))
+            if kw_var_param:
+                fn_args.append("**" + view_param(kw_var_param, var=True))
+
+            fn_arg_str: str = ", ".join(fn_args)
+
+            output(f"Calling {type(func).__name__} {func.__name__}({fn_arg_str})")
+
+            return_str: str = ""
+            return_annotation: Any = fnc_sig.return_annotation
+            if return_annotation is not inspect._empty:
+                if return_annotation is not None:
+                    return_str: str = f" -> {return_annotation.__name__}"
+                else:
+                    return_str: str = f" -> None"
+
+            timer = datetime.datetime.now()
 
             try:
                 result = func(*args, **kwargs)
             except Exception as e:
-                output(f"Exception in {type(func).__name__} {func.__name__}: {e!r}")
-                if not catch_exceptions: raise
+                output(f"Exception in {type(func).__name__} {func.__name__}{return_str}: {e!r}")
+                if not catch_exceptions:
+                    raise
                 return None
-
-            output(f"Returned by {type(func).__name__} {func.__name__}: {type(result).__name__}[{result!r}]")
+            
+            timer = datetime.datetime.now() - timer
+            output(f"Value returned by {type(func).__name__} {func.__name__}{return_str}: {type(result).__name__}[{result!r}]")
+            output(f"Execution time for {type(func).__name__} {func.__name__}: {timer.total_seconds():.6f} seconds")
 
             return result
         return inner
